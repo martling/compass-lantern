@@ -1,0 +1,24 @@
+Portions of this software are based on "Yet Another Arduino AHRS" 
+https://github.com/swedishhat/yaaa/
+Copyright (c) 2015 Patrick Lloyd
+Licensed under the MIT license
+A copy of the MIT license can be found in LICENSES/MIT.txt
+============================================
+This software uses the I2CDEV MPU6050 Arduino library
+https://github.com/pkourany/I2CDEV_MPU6050
+Copyright (c) 2012 Jeff Rowberg
+Licensed under the MIT license
+A copy of the MIT license can be found in LICENSES/MIT.txt
+===============================================
+This software uses the Adafruit NeoPixel library
+(https://github.com/adafruit/Adafruit_NeoPixel)
+Copyright (c) Adafruit Industries
+Licensed under the GNU Lesser General Public License v3.0 (LGPL-3.0)
+A copy of the LGPL-3.0 license can be found in LICENSES/LGPL-3.0.txt
+===============================================
+This software uses the elapsedMillis library port for Arduino
+https://github.com/pfeerick/elapsedMillis
+Copyright (c) 2011 PJRC.COM, LLC 
+Licensed under the MIT license
+A copy of the MIT license can be found in LICENSES/MIT.txt
+===============================================

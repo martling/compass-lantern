@@ -1,88 +1,13 @@
-// MPU-6050 LED AHRS
-// By Patrick Lloyd
-// Uses modified demo code from Jeff Rowberg's i2cdevlib library
-// to visualize the 3D pose of the MPU-6050 with a single WS2812
-// RGB LED light strip.
-
-// License Goodness
-/* ============================================
-Adafruit NeoPixel library.
-Written by Phil Burgess / Paint Your Dragon for Adafruit Industries,
-contributions by PJRC, Michael Miller and other members of the open
-source community.
-
-NeoPixel is free software: you can redistribute it and/or modify
-it under the terms of the GNU Lesser General Public License as
-published by the Free Software Foundation, either version 3 of
-the License, or (at your option) any later version.
-
-NeoPixel is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU Lesser General Public License for more details.
-
-You should have received a copy of the GNU Lesser General Public
-License along with NeoPixel.  If not, see
-<http://www.gnu.org/licenses/>.
-===============================================
-*/
-
-/* ============================================
-I2Cdev device library code is placed under the MIT license
-Copyright (c) 2012 Jeff Rowberg
-Updates available at: https://github.com/jrowberg/i2cdevlib
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
-===============================================
-*/
-
 // Watchdog timer to reset the device if it freezes.
 #include <avr/wdt.h>
-#include <Arduino.h>
-// #include <IRremote.hpp> // include the library
-#include "PinDefinitionsAndMore.h"
 #include <elapsedMillis.h>
 
 #include <Adafruit_NeoPixel.h> // NeoPixel library from Adafruit
 #define PIXELPIN 6             // Arduino pin connected to strip
 #define NUMPIXELS 46           // Total number of RGB LEDs on strip; 46 pixels ~> 11 cm diameter @144 leds/m
 
-
 #define POTIPIN A0
 #define BUTTON_PIN 10
-
-// Nano: SCL Pin A5
-// Nano: SDA Pin A4
-// Nano: INT Pin D2
-
-// Uno: SCL Pin A5
-// Uno: SDA Pin A4
-// Uno: INT Pin D2
-
-
-#ifdef __AVR__
-#include <avr/power.h> // AVR Specific power library
-#endif
-
-// I2Cdev and MPU6050 must be installed as libraries, or else the .cpp/.h files
-// for both classes must be in the include path of your project
-#include <I2Cdev.h>
 
 // MotionApps utilizes the "Digital Motion Processor" (DMP) on the MPU-6050
 // to filter and fuse raw sensor data into useful quantities like quaternions,
