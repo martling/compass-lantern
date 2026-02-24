@@ -1,17 +1,32 @@
-// Watchdog timer to reset the device if it freezes.
-#include <avr/wdt.h>
-#include <elapsedMillis.h>
+#define IMU_INTERRUPT_PIN 2 // interrupt pin connected to MPU6050; can be D2 or D3 for Arduino Uno or Nano
+// PIN_WIRE_SDA        A4  already defined in "pins_arduino.h" for Uno/Nano
+// PIN_WIRE_SCL        A5  already defined in "pins_arduino.h" for Uno/Nano
 
-#include <Adafruit_NeoPixel.h> // NeoPixel library from Adafruit
-#define PIXELPIN 6             // Arduino pin connected to strip
-#define NUMPIXELS 46           // Total number of RGB LEDs on strip; 46 pixels ~> 11 cm diameter @144 leds/m
+#define LED_DATA_PIN 6
+#define NUM_PIXELS 46 // total number of RGB LEDs on strip; 46 pixels ~> 11 cm diameter @144 leds/m
 
-#define POTIPIN A0
+#define POT_PIN A0 // potentiometer
 #define BUTTON_PIN 10
 
-// MotionApps utilizes the "Digital Motion Processor" (DMP) on the MPU-6050
-// to filter and fuse raw sensor data into useful quantities like quaternions,
-// Euler angles, or Yaw/Pitch/Roll inertial angles
+// Calibration offsets specific to the used MPU-6050 unit (see README.md)
+#define IMU_GYRO_OFFSET_X    190
+#define IMU_GYRO_OFFSET_Y    -21
+#define IMU_GYRO_OFFSET_Z     25
+#define IMU_ACCEL_OFFSET_X -4143
+#define IMU_ACCEL_OFFSET_Y -2982
+#define IMU_ACCEL_OFFSET_Z   800
+
+#include <Adafruit_NeoPixel.h>
+#include <elapsedMillis.h>
+
+// Watchdog timer library
+// Currently deactivated, because we want to be able to see
+// when the Arduino freezes.
+// TODO: Reactivate watchdog timer after freeze problem was found.
+// #include <avr/wdt.h>
+
+// MotionApps utilizes the Digital Motion Processor (DMP) on the MPU-6050
+// to fuse raw sensor data into Yaw/Pitch/Roll angles.
 #include "MPU6050_6Axis_MotionApps20.h"
 
 // Arduino Wire library is required if I2Cdev I2CDEV_ARDUINO_WIRE implementation
@@ -20,135 +35,179 @@
 #include "Wire.h"
 #endif
 
-// Class default I2C address is 0x68
-// specific I2C addresses may be passed as a parameter here
-// AD0 low = 0x68 (default for SparkFun breakout and InvenSense evaluation board)
-// AD0 high = 0x69
-MPU6050 mpu;
-// MPU6050 mpu(0x69); // <-- use for AD0 high
+// ================================================================
+// ===                   Application States                     ===
+// ================================================================
 
-/* =========================================================================
-   NOTE: In addition to connection 5.0v, GND, SDA, and SCL, this sketch
-   depends on the MPU-6050's INT pin being connected to the Arduino's
-   external interrupt #0 pin. On the Arduino Uno and Mega 2560, this is
-   digital I/O pin 2.
- * ========================================================================= */
+int g_targetBearing = 0; // degrees
 
-// yaw/pitch/roll angles (in degrees) calculated from the quaternions
-// coming from the FIFO. Note this also requires gravity vector
-// calculations. Also note that yaw/pitch/roll angles suffer from gimbal
-// lock (for more info, see: http://en.wikipedia.org/wiki/Gimbal_lock)
-#define OUTPUT_READABLE_YAWPITCHROLL
+bool g_performSetup = true;
+
+// ================================================================
+// ===                     Helper functions                     ===
+// ================================================================
+
+// Wraps an LED index around the strip boundaries,
+// preventing out-of-bounds access on a circular strip.
+int wrapIndex(int index)
+{
+  if (index < 0)
+    return (index % NUM_PIXELS + NUM_PIXELS) % NUM_PIXELS;
+  else
+    return index % NUM_PIXELS;
+}
+
+// ================================================================
+// ===                    LED stripe controls                   ===
+// ================================================================
+
+#define DIM_BRIGHTNESS 2 // 2 seems really low, but Adafruit lib has a weird way of setting brightness; found value through trial and error
+Adafruit_NeoPixel pixels = Adafruit_NeoPixel(NUM_PIXELS, LED_DATA_PIN, NEO_GRB + NEO_KHZ800);
+
+// Sets all LEDs of "pixels" to the given RGB values.
+void setAllLEDs(int r, int g, int b)
+{
+  for (unsigned int i = 0; i < pixels.numPixels(); i++)
+    pixels.setPixelColor(i, pixels.Color(r, g, b));
+}
+
+// Simulates a broken light source: dims all LEDs then briefly
+// flashes random pixels at higher brightness.
+void flickerEffect()
+{
+  static elapsedMillis timer;
+  static unsigned int interval_ms = 0;
+
+  if (timer < interval_ms)
+    return;
+
+  setAllLEDs(DIM_BRIGHTNESS, DIM_BRIGHTNESS, DIM_BRIGHTNESS);
+
+  int flickerCount = random(1, 6);
+  for (int i = 0; i < flickerCount; i++)
+  {
+    int flickerIndex = random(0, NUM_PIXELS);
+    int flickerBrightness = random(100, 256);
+    pixels.setPixelColor(flickerIndex, pixels.Color(flickerBrightness, flickerBrightness, flickerBrightness));
+  }
+  pixels.show();
+
+  delay(40);
+
+  setAllLEDs(DIM_BRIGHTNESS, DIM_BRIGHTNESS, DIM_BRIGHTNESS);
+  pixels.show();
+
+  timer = 0;
+  interval_ms = random(700, 2500);
+}
+
+// Lights a 5-pixel arc with soft falloff around the direction
+// of yaw_deg adjusted by the target bearing offset.
+void illuminateHeading(float yaw_deg)
+{
+  int yaw_index = int(NUM_PIXELS * (180.0 + yaw_deg + g_targetBearing) / 360.0);
+
+  pixels.clear();
+  pixels.setPixelColor(wrapIndex(yaw_index - 2), pixels.Color(5, 5, 5));
+  pixels.setPixelColor(wrapIndex(yaw_index - 1), pixels.Color(25, 25, 25));
+  pixels.setPixelColor(yaw_index, pixels.Color(255, 255, 255));
+  pixels.setPixelColor(wrapIndex(yaw_index + 1), pixels.Color(25, 25, 25));
+  pixels.setPixelColor(wrapIndex(yaw_index + 2), pixels.Color(5, 5, 5));
+  pixels.show();
+}
+
+// Lights a single purple pixel at the heading
+// surrounded by the dim brightness of calibration mode.
+void illuminateHeadingForCalibration(float yaw_deg)
+{
+  int yaw_index = int(NUM_PIXELS * (180.0 + yaw_deg + g_targetBearing) / 360.0);
+
+  setAllLEDs(DIM_BRIGHTNESS, DIM_BRIGHTNESS, DIM_BRIGHTNESS);
+  pixels.setPixelColor(yaw_index, pixels.Color(255, 0, 255));
+  pixels.show();
+}
+
+// ================================================================
+// ===         IMU configuration / Reading orientation          ===
+// ================================================================
+
+// I2C address: 0x68 (AD0 low, default) or 0x69 (AD0 high)
+// Allows two MPU-6050 modules on the same I2C bus
+MPU6050 mpu(0x68);
 
 // MPU control/status vars
-bool dmpReady = false;  // set true if DMP init was successful
 uint8_t mpuIntStatus;   // holds actual interrupt status byte from MPU
-uint8_t devStatus;      // return status after each device operation (0 = success, !0 = error)
 uint16_t packetSize;    // expected DMP packet size (default is 42 bytes)
 uint16_t fifoCount;     // count of all bytes currently in FIFO
 uint8_t fifoBuffer[64]; // FIFO storage buffer
 
 // orientation/motion vars
 Quaternion q;        // [w, x, y, z]         quaternion container
-VectorInt16 aa;      // [x, y, z]            accel sensor measurements
-VectorInt16 aaReal;  // [x, y, z]            gravity-free accel sensor measurements
-VectorInt16 aaWorld; // [x, y, z]            world-frame accel sensor measurements
 VectorFloat gravity; // [x, y, z]            gravity vector
-float euler[3];      // [psi, theta, phi]    Euler angle container
 float ypr[3];        // [yaw, pitch, roll]   yaw/pitch/roll container and gravity vector
 
-int yawOffset = 0;
-
-// ================================================================
-// ===                        Helper                            ===
-// ================================================================
-// Accessor function to wrap LED index
-int wrapIndex(int index) {
-    if (index < 0) {
-        return (index % NUMPIXELS + NUMPIXELS) % NUMPIXELS;
-    }
-    return index % NUMPIXELS; 
-}
-
-// ================================================================
-// ===                NEOPIXEL AHRS ROUTINE                     ===
-// ================================================================
-
-// When we setup the NeoPixel library, we tell it how many pixels, and which pin to use to send signals.
-// Note that for older NeoPixel strips you might need to change the third parameter--see the strandtest
-// example in the lbrary folder for more information on possible values.
-Adafruit_NeoPixel pixels = Adafruit_NeoPixel(NUMPIXELS, PIXELPIN, NEO_GRB + NEO_KHZ800);
-
-void update_led_ahrs(float yaw, float pitch, float roll)
-{
-  // Note: the YPR values are in DEGREES! not radians
-
-  // Clean slate.
-  pixels.clear();
-
-  // Determine the "nose" of the AHRS from yaw angle indication
-  int yaw_index = int(NUMPIXELS * (180.0 + yaw + yawOffset) / 360.0);
-
-  // Light intensity for pitch and roll quadrants
-  // float roll_brightness = 255 * roll / 180.0;
-  // float pitch_brightness = 255 * pitch / 180.0;
-
-  // Bread and butter: Counts through a quadrant's worth of NeoPixel indecies
-  // and determines the appropriate color for all four quadrants. The pitch and
-  // roll brightness values then scale how red, blue, or green each pixel. This
-  // emulates in admittedly simplistic fashion a Great Circle around an RGB
-  // sphere with red at the "South Pole", green at the "Equator", and blue at
-  // the "North Pole". Green values are inversely proportional to pitch and roll
-  // int i;
-  // for (i = 0; i < (NUMPIXELS / 4); i++){
-  //   if (pitch >= 0) {
-  //     pixels.setPixelColor((yaw_index - (NUMPIXELS/8) + i) % NUMPIXELS, pixels.Color(pitch_brightness, 255-2*pitch_brightness, 0));
-  //     pixels.setPixelColor((yaw_index + (3*NUMPIXELS/8) + i) % NUMPIXELS, pixels.Color(0, 255-2*pitch_brightness, pitch_brightness));
-  //   } else {
-  //     pixels.setPixelColor((yaw_index - (NUMPIXELS/8) + i) % NUMPIXELS, pixels.Color(0, 255 + 2*pitch_brightness, -1 * pitch_brightness));
-  //     pixels.setPixelColor((yaw_index + (3*NUMPIXELS/8) + i) % NUMPIXELS, pixels.Color(-1 * pitch_brightness, 255 + 2*pitch_brightness, 0));
-  //   }
-
-  //   if (roll >= 0) {
-  //     pixels.setPixelColor((yaw_index - (3*NUMPIXELS/8) + i) % NUMPIXELS, pixels.Color(roll_brightness, 255-roll_brightness, 0));
-  //     pixels.setPixelColor((yaw_index + (NUMPIXELS/8) + i) % NUMPIXELS, pixels.Color(0, 255-roll_brightness, roll_brightness));
-  //   } else {
-  //     pixels.setPixelColor((yaw_index - (3*NUMPIXELS/8) + i) % NUMPIXELS, pixels.Color(0, 255 + 2*roll_brightness, -1 * roll_brightness));
-  //     pixels.setPixelColor((yaw_index + (NUMPIXELS/8) + i) % NUMPIXELS, pixels.Color(-1 * roll_brightness, 255 + 2*roll_brightness, 0));
-  //   }
-  // }
-
-  // Set the "nose indicator" and turn the device on
-  pixels.setPixelColor(yaw_index, pixels.Color(255, 255, 255)); // White as can be
-  pixels.show();
-}
-
-void shine_to_direction(float yaw)
-{
-  // Note: the YPR values are in DEGREES! not radians
-
-  pixels.clear();
-
-  // Determine the "nose" of the AHRS from yaw angle indication
-  int yaw_index = int(NUMPIXELS * (180.0 + yaw + yawOffset) / 360.0);
-
-  pixels.setPixelColor(wrapIndex(yaw_index-2), pixels.Color(5,5,5));
-  pixels.setPixelColor(wrapIndex(yaw_index-1), pixels.Color(25,25,25));
-  pixels.setPixelColor(yaw_index, pixels.Color(255, 255, 255)); // White as can be
-  pixels.setPixelColor(wrapIndex(yaw_index+1), pixels.Color(25,25,25));
-  pixels.setPixelColor(wrapIndex(yaw_index+2), pixels.Color(5,5,5));
-  pixels.show();
-}
-
-// ================================================================
-// ===               INTERRUPT DETECTION ROUTINE                ===
-// ================================================================
-
 // indicates whether MPU interrupt pin has gone high
-volatile bool mpuInterrupt = false;
+volatile bool mpuDataReady = false;
 void dmpDataReady()
 {
-  mpuInterrupt = true;
+  mpuDataReady = true;
+}
+
+// Reads yaw from the MPU-6050 DMP.
+// Returns yaw in degrees, or NAN if no data was ready or FIFO overflowed.
+float readYawDeg()
+{
+  // skip execution if no interrupt was received from IMU
+  if (!mpuDataReady)
+    return NAN;
+
+  mpuDataReady = false;
+  mpuIntStatus = mpu.getIntStatus();
+  fifoCount = mpu.getFIFOCount();
+
+  if ((mpuIntStatus & 0x10) || fifoCount == 1024)
+  {
+    mpu.resetFIFO();
+    Serial.println(F("FIFO overflow!"));
+    return NAN;
+  }
+
+  if (mpuIntStatus & 0x02)
+  {
+    while (fifoCount < packetSize)
+      fifoCount = mpu.getFIFOCount();
+
+    mpu.getFIFOBytes(fifoBuffer, packetSize);
+    fifoCount -= packetSize;
+
+    mpu.dmpGetQuaternion(&q, fifoBuffer);
+    mpu.dmpGetGravity(&gravity, &q);
+    mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+    return ypr[0] * 180 / M_PI;
+  }
+
+  return NAN; // no data ready yet
+}
+
+// ================================================================
+// ===                      Calibration                         ===
+// ================================================================
+
+// Indicates the heading with a purple light that
+// can be moved around using the potentiometer.
+// Returns when the button is pressed, locking in the bearing.
+void calibrateTargetBearing()
+{
+  while (!digitalRead(BUTTON_PIN))
+  {
+    float yaw_deg = readYawDeg();
+    if (!isnan(yaw_deg))
+    {
+      int potValue = analogRead(POT_PIN);
+      g_targetBearing = map(potValue, 0, 1023, -180, 180);
+      illuminateHeadingForCalibration(yaw_deg);
+    }
+  }
 }
 
 // ================================================================
@@ -158,17 +217,15 @@ void dmpDataReady()
 void setup()
 {
   // One watchdog timer will reset the device if it is unresponsive
-  // for a second or more
-  /* martin: Deactivated the watch dog for now, to see how stable the gadget works; every restart of
-  the Arduino means new calibration is necessary */
+  // for two seconds or more.
+  // Currently deactivated, because we want to be able to see
+  // when the Arduino freezes.
+  // TODO: Reactivate watchdog timer after freeze problem was found.
   // wdt_enable(WDTO_2S);
 
-  // Start the receiver and if not 3. parameter specified, take LED_BUILTIN pin from the internal boards definition as default feedback LED
-  /* martin: deactivated; we do not use IR*/
-  // IrReceiver.begin(3, true);
-  // printActiveIRProtocols(&Serial);
-
   pinMode(BUTTON_PIN, INPUT);
+
+  Serial.begin(38400);
 
 // join I2C bus (I2Cdev library doesn't do this automatically)
 #if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
@@ -180,50 +237,37 @@ void setup()
 
   // Start the NeoPixel device and turn all the LEDs off
   pixels.begin();
-  pixels.show(); // Initialize all pixels to 'off'
+  pixels.clear();
+  pixels.show();
 
-  // initialize serial communication
-  Serial.begin(38400);
-  while (!Serial)
-    ; // wait for Leonardo enumeration, others continue immediately
-
-  // initialize device
+  // Initialize, verify, and configure MPU-6050
   Serial.println(F("Initializing I2C devices..."));
   mpu.initialize();
 
-  // verify connection
   Serial.println(F("Testing device connections..."));
   Serial.println(mpu.testConnection() ? F("MPU6050 connection successful") : F("MPU6050 connection failed"));
 
-  // load and configure the DMP
   Serial.println(F("Initializing DMP..."));
-  devStatus = mpu.dmpInitialize();
+  uint8_t devStatus = mpu.dmpInitialize();
 
-  // supply your own gyro offsets here, scaled for min sensitivity
-  mpu.setXGyroOffset(190);
-  mpu.setYGyroOffset(-21);
-  mpu.setZGyroOffset(25);
-  mpu.setXAccelOffset(-4143);
-  mpu.setYAccelOffset(-2982);
-  mpu.setZAccelOffset(800);
+  mpu.setXGyroOffset(IMU_GYRO_OFFSET_X);
+  mpu.setYGyroOffset(IMU_GYRO_OFFSET_Y);
+  mpu.setZGyroOffset(IMU_GYRO_OFFSET_Z);
+  mpu.setXAccelOffset(IMU_ACCEL_OFFSET_X);
+  mpu.setYAccelOffset(IMU_ACCEL_OFFSET_Y);
+  mpu.setZAccelOffset(IMU_ACCEL_OFFSET_Z);
 
-  // make sure it worked (returns 0 if so)
   if (devStatus == 0)
   {
-    // turn on the DMP, now that it's ready
     Serial.println(F("Enabling DMP..."));
     mpu.setDMPEnabled(true);
 
-    // enable Arduino interrupt detection
-    Serial.println(F("Enabling interrupt detection (Arduino external interrupt 0)..."));
-    attachInterrupt(0, dmpDataReady, RISING);
+    Serial.println(F("Enabling interrupt detection..."));
+    attachInterrupt(digitalPinToInterrupt(IMU_INTERRUPT_PIN), dmpDataReady, RISING);
     mpuIntStatus = mpu.getIntStatus();
 
-    // set our DMP Ready flag so the main loop() function knows it's okay to use it
     Serial.println(F("DMP ready! Waiting for first interrupt..."));
-    dmpReady = true;
 
-    // get expected DMP packet size for later comparison
     packetSize = mpu.dmpGetFIFOPacketSize();
   }
   else
@@ -235,6 +279,10 @@ void setup()
     Serial.print(F("DMP Initialization failed (code "));
     Serial.print(devStatus);
     Serial.println(F(")"));
+
+    // halt code execution; without working DMP entering loop() is pointless
+    while (true)
+      ;
   }
 }
 
@@ -242,179 +290,51 @@ void setup()
 // ===                    MAIN PROGRAM LOOP                     ===
 // ================================================================
 
-/* martin: After each reset of the arduino the fixed direction needs to be
-           calibrated again. The idea is to set the lamp in a non-working mode
-           (e.g.flickering lights) to indicate it is not working and then use
-           the potentiometer and a button to calibrate and enter working mode. */
-bool performSetup = true;
-elapsedMillis setupFlickeringTimer;
-int setupFlickeringInterval_ms = 0; // starts at 0 to light up immedtialey; gets set to a random time each cycle
+// Temporary debug output — remove once freeze issue is resolved. (TODO)
+void debugSerialOutput(float yaw_deg)
+{
+  static unsigned int starttime = millis();
+  static elapsedMillis debugOutputTimer;
+  static unsigned int debugOutputInterval_ms = 1000;
 
-/* martin: Storing starttime to determine how long the programs runs before 
-           it freezes. */
-elapsedMillis debugOutputTimer;
-int debugOutputInterval_ms = 1000;
-int starttime;
+  if (debugOutputTimer > debugOutputInterval_ms)
+  {
+    Serial.print((millis() - starttime) / 1000);
+    Serial.print("s: ");
+    Serial.println(yaw_deg + g_targetBearing);
+    debugOutputTimer = 0;
+  }
+}
 
 void loop()
 {
-  // the program is alive...for now.
-  wdt_reset();
+  // Send alive notice to watchdog.
+  // Currently deactivated, because we want to be able to see
+  // when the Arduino freezes.
+  // TODO: Reactivate watchdog timer after freeze problem was found.
+  // wdt_reset();
 
-  // if programming failed, don't try to do anything
-  if (!dmpReady)
-    return;
-
-  if (performSetup)
+  if (g_performSetup) // flicker until calibrated, then enter working mode
   {
-    // flickering eyecandy
-    if (setupFlickeringTimer > setupFlickeringInterval_ms)
-    {
-      // Set all pixels to low brightness at the start
-      for (int i = 0; i < pixels.numPixels(); i++)
-      {
-        pixels.setPixelColor(i, pixels.Color(2, 2, 2)); // Low brightness
-      }
+    while (!digitalRead(BUTTON_PIN))
+      flickerEffect();
 
-      // Randomly flicker a few pixels to higher brightness
-      int flickerCount = random(1, 6); // Choose how many pixels to flicker (1 to 5)
-      for (int j = 0; j < flickerCount; j++)
-      {
-        int flickerIndex = random(0, NUMPIXELS);  // Select a random pixel to flicker
-        int flickerBrightness = random(100, 256); // Random higher brightness (100-255)
-        pixels.setPixelColor(flickerIndex, pixels.Color(flickerBrightness, flickerBrightness, flickerBrightness));
-      }
+    while (digitalRead(BUTTON_PIN))
+      ; // wait for button release
 
-      pixels.show(); // Update the strip with the new colors
-      delay(40);     // Short delay for flicker effect
-
-      // Reset all pixels back to low brightness
-      for (int i = 0; i < pixels.numPixels(); i++)
-      {
-        pixels.setPixelColor(i, pixels.Color(2, 2, 2)); // Low brightness
-      }
-
-      pixels.show(); // Update the strip again
-      setupFlickeringTimer = 0;
-      setupFlickeringInterval_ms = random(700, 2500); // Random delay to vary the flickering pattern
-    }
-
-    // wait for button to enter calibration mode
-    if (digitalRead(BUTTON_PIN))
-    {
-      performSetup = false;
-      delay(2000);
-
-      // wait until next press to leave calibration mode
-      while (!digitalRead(BUTTON_PIN))
-      {
-        // reset interrupt flag and get INT_STATUS byte
-        mpuInterrupt = false;
-        mpuIntStatus = mpu.getIntStatus();
-
-        // get current FIFO count
-        fifoCount = mpu.getFIFOCount();
-
-        // check for overflow (this should never happen unless our code is too inefficient)
-        if ((mpuIntStatus & 0x10) || fifoCount == 1024)
-        {
-          // reset so we can continue cleanly
-          mpu.resetFIFO();
-          Serial.println(F("FIFO overflow!"));
-
-          // otherwise, check for DMP data ready interrupt (this should happen frequently)
-        }
-        else if (mpuIntStatus & 0x02)
-        {
-          // wait for correct available data length, should be a VERY short wait
-          while (fifoCount < packetSize)
-            fifoCount = mpu.getFIFOCount();
-
-          // read a packet from FIFO
-          mpu.getFIFOBytes(fifoBuffer, packetSize);
-
-          // track FIFO count here in case there is > 1 packet available
-          // (this lets us immediately read more without waiting for an interrupt)
-          fifoCount -= packetSize;
-
-          // display Euler angles in degrees
-          mpu.dmpGetQuaternion(&q, fifoBuffer);
-          mpu.dmpGetGravity(&gravity, &q);
-          mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
-          float yaw_deg = ypr[0] * 180 / M_PI;
-
-          // adjust yaw depending on potentiometer
-          int potValue = analogRead(POTIPIN);
-          yawOffset = map(potValue, 0, 1023, -180, 180);
-          int adjustedYaw = fmod(yaw_deg + yawOffset, 360);
-          if (adjustedYaw > 180)
-          {
-            adjustedYaw -= 360; // Convert to negative if above 180
-          }
-
-          for (int i = 0; i < pixels.numPixels(); i++)
-          {
-            pixels.setPixelColor(i, pixels.Color(2, 2, 2)); // Low brightness
-          }
-          int yaw_index = int(NUMPIXELS * (180.0 + yaw_deg + yawOffset) / 360.0);
-          
-          pixels.setPixelColor(yaw_index, pixels.Color(255, 0, 255));  // violet for better contrast against white during calibration
-          pixels.show();
-        }
-        starttime = millis(); // is set to calculate total runtime during the working loop
-      }
-    }
+    calibrateTargetBearing();
+    g_performSetup = false;
   }
-  else // working loop
+  else // bearing is calibrated; illuminate heading continuously
   {
-    // reset interrupt flag and get INT_STATUS byte
-    mpuInterrupt = false;
-    mpuIntStatus = mpu.getIntStatus();
+    float yaw_deg = readYawDeg();
 
-    // get current FIFO count
-    fifoCount = mpu.getFIFOCount();
-
-    // check for overflow (this should never happen unless our code is too inefficient)
-    if ((mpuIntStatus & 0x10) || fifoCount == 1024)
+    if (!isnan(yaw_deg))
     {
-      // reset so we can continue cleanly
-      mpu.resetFIFO();
-      Serial.println(F("FIFO overflow!"));
+      illuminateHeading(yaw_deg);
 
-      // otherwise, check for DMP data ready interrupt (this should happen frequently)
-    }
-    else if (mpuIntStatus & 0x02)
-    {
-      // wait for correct available data length, should be a VERY short wait
-      while (fifoCount < packetSize)
-        fifoCount = mpu.getFIFOCount();
-
-      // read a packet from FIFO
-      mpu.getFIFOBytes(fifoBuffer, packetSize);
-
-      // track FIFO count here in case there is > 1 packet available
-      // (this lets us immediately read more without waiting for an interrupt)
-      fifoCount -= packetSize;
-
-      // display Euler angles in degrees
-      mpu.dmpGetQuaternion(&q, fifoBuffer);
-      mpu.dmpGetGravity(&gravity, &q);
-      mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
-      float yaw_deg = ypr[0] * 180 / M_PI;
-      /* martin: pitch_deg and roll_deg and not necessary for our lighting setup */
-      // float pitch_deg = ypr[1] * 180 / M_PI;
-      // float roll_deg = ypr[2] * 180 / M_PI;
-
-      // make pretty colors happen
-      shine_to_direction(yaw_deg);
-
-      if (debugOutputTimer > debugOutputInterval_ms)
-      {
-        Serial.print((millis()-starttime)/1000);
-        Serial.print("s: ");
-        Serial.println(yaw_deg+yawOffset);
-        debugOutputTimer = 0;
-      }
+      // TODO: remove debug output when not necessary anymore
+      debugSerialOutput(yaw_deg);
     }
   }
 }
